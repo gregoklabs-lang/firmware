@@ -1,0 +1,355 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <esp_wifi.h>
+#include <stdarg.h>
+
+#include "oled_display.h"
+#include "provisioning.h"
+
+namespace
+{
+  constexpr int kBleButtonPin = 0;
+  constexpr uint32_t kBleSessionDurationMs = 60000;
+  constexpr uint32_t kWifiConnectTimeoutMs = 15000;
+  constexpr uint32_t kButtonDebounceMs = 200;
+  constexpr uint32_t kBleActivationHoldMs = 3000;
+
+  enum class SystemState : uint8_t
+  {
+    WIFI_DISCONNECTED = 0,
+    WIFI_CONNECTED,
+    BLE_ACTIVE,
+  };
+
+  String g_deviceId;
+  SystemState g_state = SystemState::WIFI_DISCONNECTED;
+
+  bool g_wifiConnected = false;
+  bool g_wifiConnecting = false;
+  uint32_t g_wifiConnectStart = 0;
+
+  bool g_bleActive = false;
+  uint32_t g_bleStartMs = 0;
+
+  volatile bool g_bleButtonInterrupt = false;
+  uint32_t g_lastButtonHandledMs = 0;
+  bool g_bleButtonPending = false;
+  uint32_t g_bleButtonPressStartMs = 0;
+
+  void logWithDeviceId(const char *fmt, ...)
+  {
+    char buffer[256] = {0};
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(buffer, sizeof(buffer), fmt, args);
+    va_end(args);
+
+    const char *deviceId = g_deviceId.length() > 0 ? g_deviceId.c_str() : "UNKNOWN";
+    Serial.printf("[%s] %s", deviceId, buffer);
+  }
+
+  void IRAM_ATTR onBleButtonPressed() { g_bleButtonInterrupt = true; }
+
+  String formatState(SystemState state)
+  {
+    switch (state)
+    {
+    case SystemState::WIFI_CONNECTED:
+      return "WIFI_CONNECTED";
+    case SystemState::BLE_ACTIVE:
+      return "BLE_ACTIVE";
+    default:
+      return "WIFI_DISCONNECTED";
+    }
+  }
+
+  void updateSystemState()
+  {
+    SystemState newState = SystemState::WIFI_DISCONNECTED;
+    if (g_bleActive)
+    {
+      newState = SystemState::BLE_ACTIVE;
+    }
+    else if (g_wifiConnected)
+    {
+      newState = SystemState::WIFI_CONNECTED;
+    }
+
+    if (newState != g_state)
+    {
+      g_state = newState;
+      logWithDeviceId("[ESTADO] %s\n", formatState(g_state).c_str());
+    }
+  }
+
+  void applyWifiConnectionStatus(bool connected)
+  {
+    if (g_wifiConnected != connected)
+    {
+      g_wifiConnected = connected;
+      logWithDeviceId("[WIFI] Estado -> %s\n", connected ? "conectado" : "desconectado");
+      Display::setConnectionStatus(connected);
+      updateSystemState();
+    }
+    else
+    {
+      Display::setConnectionStatus(connected);
+    }
+  }
+
+  void clearStoredWifiCredentials()
+  {
+    const bool wasConnected = g_wifiConnected;
+    WiFi.disconnect(true, true);
+    g_wifiConnecting = false;
+    applyWifiConnectionStatus(false);
+    if (wasConnected)
+    {
+      Provisioning::notifyStatus("wifi:desconectado");
+    }
+    logWithDeviceId("[WIFI] Credenciales eliminadas\n");
+  }
+
+  void stopBleSession()
+  {
+    if (!g_bleActive)
+    {
+      return;
+    }
+
+    Provisioning::stopBle();
+    g_bleActive = false;
+    Display::setBleActive(false);
+    updateSystemState();
+  }
+
+  void startBleSession()
+  {
+    if (Provisioning::startBle())
+    {
+      g_bleActive = true;
+      g_bleStartMs = millis();
+      Display::setBleActive(true);
+      updateSystemState();
+      logWithDeviceId("[BLE] Sesion de aprovisionamiento activa por 60s\n");
+    }
+    else if (g_bleActive)
+    {
+      g_bleStartMs = millis();
+    }
+    else
+    {
+      logWithDeviceId("[BLE] No se pudo iniciar el modo de aprovisionamiento\n");
+    }
+  }
+
+  void startWifiConnection(const char *ssid = nullptr, const char *password = nullptr)
+  {
+    WiFi.disconnect(false, false);
+
+    if (ssid && password)
+    {
+      logWithDeviceId("[WIFI] Conectando a '%s'\n", ssid);
+      WiFi.begin(ssid, password);
+    }
+    else
+    {
+      logWithDeviceId("[WIFI] Conectando con credenciales guardadas\n");
+      WiFi.begin();
+    }
+
+    g_wifiConnecting = true;
+    g_wifiConnectStart = millis();
+  }
+
+  bool hasStoredCredentials()
+  {
+    wifi_config_t config;
+    if (esp_wifi_get_config(WIFI_IF_STA, &config) != ESP_OK)
+    {
+      return false;
+    }
+    return config.sta.ssid[0] != '\0';
+  }
+
+  String buildDeviceId()
+  {
+    uint8_t mac[6] = {0};
+    if (esp_wifi_get_mac(WIFI_IF_STA, mac) != ESP_OK)
+    {
+      WiFi.macAddress(mac);
+    }
+
+    char suffix[7] = {0};
+    snprintf(suffix, sizeof(suffix), "%02X%02X%02X", mac[3], mac[4], mac[5]);
+
+    String id = "OLEO_";
+    id += suffix;
+    return id;
+  }
+
+  void onProvisionedCredentials(const String &ssid, const String &password)
+  {
+  logWithDeviceId("[BLE] Credenciales recibidas para SSID '%s'\n", ssid.c_str());
+    Provisioning::notifyStatus("wifi:conectando");
+    applyWifiConnectionStatus(false);
+    startWifiConnection(ssid.c_str(), password.c_str());
+  }
+
+  void handleBleButton()
+  {
+    uint32_t now = millis();
+
+    if (g_bleButtonInterrupt)
+    {
+      g_bleButtonInterrupt = false;
+
+      if (now - g_lastButtonHandledMs >= kButtonDebounceMs &&
+          digitalRead(kBleButtonPin) == LOW)
+      {
+        if (!g_bleButtonPending)
+        {
+          g_bleButtonPending = true;
+          g_bleButtonPressStartMs = now;
+        }
+        g_lastButtonHandledMs = now;
+      }
+    }
+
+    if (!g_bleButtonPending)
+    {
+      return;
+    }
+
+    if (digitalRead(kBleButtonPin) == LOW)
+    {
+      now = millis();
+      if (now - g_bleButtonPressStartMs >= kBleActivationHoldMs)
+      {
+        g_bleButtonPending = false;
+        g_lastButtonHandledMs = now;
+        clearStoredWifiCredentials();
+        startBleSession();
+      }
+      return;
+    }
+
+    g_bleButtonPending = false;
+  }
+
+  void handleBleTimeout()
+  {
+    if (!g_bleActive)
+    {
+      return;
+    }
+
+    if (millis() - g_bleStartMs >= kBleSessionDurationMs)
+    {
+      logWithDeviceId("[BLE] Tiempo de aprovisionamiento agotado\n");
+      stopBleSession();
+    }
+  }
+
+  void handleWifiStatus()
+  {
+    wl_status_t status = WiFi.status();
+
+    if (status == WL_CONNECTED)
+    {
+      if (!g_wifiConnected)
+      {
+        applyWifiConnectionStatus(true);
+        {
+          String ip = WiFi.localIP().toString();
+          logWithDeviceId("[WIFI] IP: %s\n", ip.c_str());
+        }
+        Provisioning::notifyStatus("wifi:conectado");
+        stopBleSession();
+      }
+      g_wifiConnecting = false;
+      return;
+    }
+
+    if (g_wifiConnected)
+    {
+      logWithDeviceId("[WIFI] Conexion perdida\n");
+      applyWifiConnectionStatus(false);
+      Provisioning::notifyStatus("wifi:desconectado");
+    }
+
+    if (!g_wifiConnecting)
+    {
+      return;
+    }
+
+    const uint32_t elapsed = millis() - g_wifiConnectStart;
+    if (status == WL_CONNECT_FAILED || status == WL_NO_SSID_AVAIL ||
+        elapsed > kWifiConnectTimeoutMs)
+    {
+      logWithDeviceId("[WIFI] Error al conectar\n");
+      Provisioning::notifyStatus("wifi:error");
+      WiFi.disconnect(false, false);
+      g_wifiConnecting = false;
+      applyWifiConnectionStatus(false);
+    }
+  }
+
+  void configureButton()
+  {
+    pinMode(kBleButtonPin, INPUT_PULLUP);
+    attachInterrupt(digitalPinToInterrupt(kBleButtonPin), onBleButtonPressed,
+                    FALLING);
+  }
+
+} // namespace
+
+void setup()
+{
+  Serial.begin(115200);
+
+  WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(true);
+  WiFi.persistent(true);
+
+  g_deviceId = buildDeviceId();
+  logWithDeviceId("[BOOT] device_id: %s\n", g_deviceId.c_str());
+
+  Display::begin();
+  Display::setConnectionStatus(false);
+  Display::setBleActive(false);
+  Display::forceRender();
+
+  Provisioning::begin(g_deviceId, onProvisionedCredentials);
+
+  configureButton();
+
+  if (hasStoredCredentials())
+  {
+    logWithDeviceId("[WIFI] Credenciales guardadas detectadas\n");
+    startWifiConnection();
+  }
+  else
+  {
+    logWithDeviceId("[WIFI] No hay credenciales guardadas\n");
+    applyWifiConnectionStatus(false);
+    updateSystemState();
+  }
+}
+
+void loop()
+{
+  handleBleButton();
+  handleBleTimeout();
+  handleWifiStatus();
+
+  if (!g_wifiConnecting && !g_wifiConnected && !g_bleActive)
+  {
+    updateSystemState();
+  }
+
+  Provisioning::loop();
+  Display::loop();
+
+  delay(1);
+}
