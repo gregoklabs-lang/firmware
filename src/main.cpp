@@ -3,9 +3,26 @@
 #include <esp_wifi.h>
 #include <stdarg.h>
 #include <Preferences.h>
+#include <WiFiClientSecure.h>
+#include <PubSubClient.h>
+#include <FS.h>
+#include <SPIFFS.h>
 
 #include "oled_display.h"
 #include "provisioning.h"
+
+// ======================
+// 🔹 CONFIGURACIÓN AWS
+// ======================
+const char *AWS_IOT_ENDPOINT = "a7xxu98k219gv-ats.iot.us-east-1.amazonaws.com";
+const int AWS_IOT_PORT = 8883;
+
+#define ROOT_CA_PATH "/certs/AmazonRootCA1.pem"
+#define CERT_PATH "/certs/device.pem.crt"
+#define KEY_PATH "/certs/private.pem.key"
+
+WiFiClientSecure net;
+PubSubClient mqttClient(net);
 
 namespace
 {
@@ -15,6 +32,7 @@ namespace
   constexpr uint32_t kButtonDebounceMs = 200;
   constexpr uint32_t kBleActivationHoldMs = 3000;
   constexpr uint32_t kIdentityLogDelayMs = 6000;
+  constexpr uint32_t kAwsReconnectDelayMs = 5000;
 
   enum class SystemState : uint8_t
   {
@@ -48,6 +66,12 @@ namespace
   uint32_t g_identityLogTargetMs = 0;
   bool g_identityLogReady = false;
 
+  // ===== AWS Flags
+  bool g_awsConnected = false;
+  uint32_t g_lastAwsAttempt = 0;
+  bool g_claimPending = false;
+
+  // ========================== LOGGING
   void logWithDeviceId(const char *fmt, ...)
   {
     char buffer[256] = {0};
@@ -62,6 +86,125 @@ namespace
 
   void IRAM_ATTR onBleButtonPressed() { g_bleButtonInterrupt = true; }
 
+  // ========================== AWS HELPERS
+
+  bool setupAWS()
+  {
+    if (!SPIFFS.begin(true))
+    {
+      Serial.println("[SPIFFS] ❌ Error al montar");
+      return false;
+    }
+
+    if (!SPIFFS.exists(ROOT_CA_PATH) || !SPIFFS.exists(CERT_PATH) || !SPIFFS.exists(KEY_PATH))
+    {
+      Serial.println("[AWS] ❌ Certificados no encontrados en SPIFFS");
+      return false;
+    }
+
+    File ca = SPIFFS.open(ROOT_CA_PATH, "r");
+    File cert = SPIFFS.open(CERT_PATH, "r");
+    File key = SPIFFS.open(KEY_PATH, "r");
+
+    if (!ca || !cert || !key)
+    {
+      Serial.println("[AWS] ❌ No se pudieron abrir los certificados");
+      return false;
+    }
+
+    String rootCA = ca.readString();
+    String deviceCert = cert.readString();
+    String privateKey = key.readString();
+
+    ca.close();
+    cert.close();
+    key.close();
+
+    net.setCACert(rootCA.c_str());
+    net.setCertificate(deviceCert.c_str());
+    net.setPrivateKey(privateKey.c_str());
+
+    mqttClient.setServer(AWS_IOT_ENDPOINT, AWS_IOT_PORT);
+    mqttClient.setBufferSize(1024);
+    logWithDeviceId("[AWS] Configuracion MQTT lista\n");
+    return true;
+  }
+
+  bool connectAWS()
+  {
+    if (mqttClient.connected()) return true;
+
+    if (millis() - g_lastAwsAttempt < kAwsReconnectDelayMs) return false;
+    g_lastAwsAttempt = millis();
+
+    Serial.print("[AWS] 🔌 Conectando a IoT Core... ");
+    if (mqttClient.connect(g_deviceId.c_str()))
+    {
+      Serial.println("✅ Conectado");
+      g_awsConnected = true;
+      return true;
+    }
+    else
+    {
+      Serial.printf("❌ Falla MQTT rc=%d\n", mqttClient.state());
+      g_awsConnected = false;
+      return false;
+    }
+  }
+
+  void sendProvisioningClaim()
+  {
+    if (!g_claimPending || !mqttClient.connected())
+    {
+      return;
+    }
+
+    if (g_userId.isEmpty())
+    {
+      logWithDeviceId("[AWS] Mensaje MQTT no enviado (user_id vacio)\n");
+      g_claimPending = false;
+      return;
+    }
+
+    const String payload = "{\"device_id\":\"" + g_deviceId + "\",\"user_id\":\"" + g_userId + "\"}";
+    const String topic = "devices/" + g_deviceId + "/claim";
+
+    logWithDeviceId("[AWS] Publicando claim -> %s\n", payload.c_str());
+
+    if (mqttClient.publish(topic.c_str(), payload.c_str()))
+    {
+      logWithDeviceId("[AWS] Mensaje MQTT enviado\n");
+      g_claimPending = false;
+    }
+    else
+    {
+      logWithDeviceId("[AWS] Mensaje MQTT no enviado\n");
+    }
+  }
+
+  void handleAWS()
+  {
+    if (!g_wifiConnected)
+    {
+      g_awsConnected = false;
+      return;
+    }
+
+    if (!mqttClient.connected())
+    {
+      if (connectAWS())
+      {
+        sendProvisioningClaim();
+      }
+    }
+    else
+    {
+      mqttClient.loop();
+      sendProvisioningClaim();
+    }
+  }
+
+  // ========================== (Tu código original sigue igual)
   String formatState(SystemState state)
   {
     switch (state)
@@ -289,6 +432,8 @@ namespace
       scheduleIdentityLog();
       logWithDeviceId("[BLE] user_id recibido: %s\n", userId.c_str());
     }
+
+    g_claimPending = true;
   }
 
   void handleBleButton()
@@ -360,6 +505,8 @@ namespace
           logWithDeviceId("[WIFI] IP: %s\n", ip.c_str());
         }
         Provisioning::notifyStatus("wifi:conectado");
+        setupAWS();     
+        connectAWS();   // 👈 Se conecta a AWS inmediatamente
         stopBleSession();
       }
       g_wifiConnecting = false;
@@ -441,6 +588,7 @@ void loop()
   handleBleTimeout();
   handleWifiStatus();
   logIdentityIfDue();
+  handleAWS(); // 👈 mantiene viva la conexión MQTT
 
   if (!g_wifiConnecting && !g_wifiConnected && !g_bleActive)
   {
