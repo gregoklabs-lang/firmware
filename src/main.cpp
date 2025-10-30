@@ -2,6 +2,7 @@
 #include <WiFi.h>
 #include <esp_wifi.h>
 #include <stdarg.h>
+#include <Preferences.h>
 
 #include "oled_display.h"
 #include "provisioning.h"
@@ -13,6 +14,7 @@ namespace
   constexpr uint32_t kWifiConnectTimeoutMs = 15000;
   constexpr uint32_t kButtonDebounceMs = 200;
   constexpr uint32_t kBleActivationHoldMs = 3000;
+  constexpr uint32_t kIdentityLogDelayMs = 6000;
 
   enum class SystemState : uint8_t
   {
@@ -21,7 +23,15 @@ namespace
     BLE_ACTIVE,
   };
 
+  Preferences g_identityPrefs;
+  bool g_identityPrefsReady = false;
+  constexpr char kPrefsNamespace[] = "identity";
+  constexpr char kPrefsDeviceIdKey[] = "device_id";
+  constexpr char kPrefsUserIdKey[] = "user_id";
+
   String g_deviceId;
+  String g_userId;
+  String g_macAddress;
   SystemState g_state = SystemState::WIFI_DISCONNECTED;
 
   bool g_wifiConnected = false;
@@ -35,6 +45,8 @@ namespace
   uint32_t g_lastButtonHandledMs = 0;
   bool g_bleButtonPending = false;
   uint32_t g_bleButtonPressStartMs = 0;
+  uint32_t g_identityLogTargetMs = 0;
+  bool g_identityLogReady = false;
 
   void logWithDeviceId(const char *fmt, ...)
   {
@@ -172,6 +184,77 @@ namespace
     return config.sta.ssid[0] != '\0';
   }
 
+  bool beginIdentityPrefs()
+  {
+    if (g_identityPrefsReady)
+    {
+      return true;
+    }
+
+    g_identityPrefsReady = g_identityPrefs.begin(kPrefsNamespace, false);
+    if (!g_identityPrefsReady)
+    {
+      Serial.println("[identity] No se pudieron abrir las preferencias");
+    }
+    return g_identityPrefsReady;
+  }
+
+  void persistDeviceId()
+  {
+    if (!beginIdentityPrefs())
+    {
+      return;
+    }
+
+    g_identityPrefs.putString(kPrefsDeviceIdKey, g_deviceId);
+  }
+
+  void loadStoredUserId()
+  {
+    if (!beginIdentityPrefs())
+    {
+      g_userId = "";
+      return;
+    }
+
+    g_userId = g_identityPrefs.getString(kPrefsUserIdKey, "");
+  }
+
+  void storeUserId(const String &userId)
+  {
+    if (!beginIdentityPrefs())
+    {
+      return;
+    }
+
+    g_userId = userId;
+    g_identityPrefs.putString(kPrefsUserIdKey, g_userId);
+  }
+
+  void scheduleIdentityLog()
+  {
+    g_identityLogTargetMs = millis() + kIdentityLogDelayMs;
+    g_identityLogReady = false;
+  }
+
+  void logIdentityIfDue()
+  {
+    if (g_identityLogReady)
+    {
+      return;
+    }
+
+    if (millis() < g_identityLogTargetMs)
+    {
+      return;
+    }
+
+    const char *userId = g_userId.length() > 0 ? g_userId.c_str() : "(sin user_id)";
+    logWithDeviceId("[IDENTIDAD] MAC: %s\n", g_macAddress.c_str());
+    logWithDeviceId("[IDENTIDAD] user_id: %s\n", userId);
+    g_identityLogReady = true;
+  }
+
   String buildDeviceId()
   {
     uint8_t mac[6] = {0};
@@ -179,6 +262,11 @@ namespace
     {
       WiFi.macAddress(mac);
     }
+
+    char macFormatted[18] = {0};
+    snprintf(macFormatted, sizeof(macFormatted), "%02X:%02X:%02X:%02X:%02X:%02X",
+             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    g_macAddress = String(macFormatted);
 
     char suffix[7] = {0};
     snprintf(suffix, sizeof(suffix), "%02X%02X%02X", mac[3], mac[4], mac[5]);
@@ -188,12 +276,19 @@ namespace
     return id;
   }
 
-  void onProvisionedCredentials(const String &ssid, const String &password)
+  void onProvisionedCredentials(const String &ssid, const String &password, const String &userId)
   {
-  logWithDeviceId("[BLE] Credenciales recibidas para SSID '%s'\n", ssid.c_str());
+    logWithDeviceId("[BLE] Credenciales recibidas para SSID '%s'\n", ssid.c_str());
     Provisioning::notifyStatus("wifi:conectando");
     applyWifiConnectionStatus(false);
     startWifiConnection(ssid.c_str(), password.c_str());
+
+    if (userId.length() > 0)
+    {
+      storeUserId(userId);
+      scheduleIdentityLog();
+      logWithDeviceId("[BLE] user_id recibido: %s\n", userId.c_str());
+    }
   }
 
   void handleBleButton()
@@ -313,6 +408,9 @@ void setup()
   WiFi.persistent(true);
 
   g_deviceId = buildDeviceId();
+  persistDeviceId();
+  loadStoredUserId();
+  scheduleIdentityLog();
   logWithDeviceId("[BOOT] device_id: %s\n", g_deviceId.c_str());
 
   Display::begin();
@@ -342,6 +440,7 @@ void loop()
   handleBleButton();
   handleBleTimeout();
   handleWifiStatus();
+  logIdentityIfDue();
 
   if (!g_wifiConnecting && !g_wifiConnected && !g_bleActive)
   {

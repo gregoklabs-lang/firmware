@@ -5,7 +5,8 @@
 #include <functional>
 
 namespace Provisioning {
-using CredentialsCallback = std::function<void(const String &, const String &)>;
+using CredentialsCallback =
+    std::function<void(const String &, const String &, const String &)>;
 
 void begin(const String &deviceId, CredentialsCallback callback);
 

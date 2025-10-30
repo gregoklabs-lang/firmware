@@ -7,7 +7,12 @@
 #include <BLEUtils.h>
 
 #include <algorithm>
+#include <cstdio>
+#include <cstring>
 #include <string>
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
 
 namespace Provisioning {
 namespace {
@@ -26,10 +31,47 @@ bool g_centralConnected = false;
 uint16_t g_connId = kInvalidConnId;
 volatile bool g_restartAdvertising = false;
 
+constexpr size_t kProvisioningQueueLength = 6;
+constexpr size_t kMaxNotifyLength = 64;
+constexpr size_t kMaxSsidLength = 33;    // 32 + null
+constexpr size_t kMaxPasswordLength = 65; // 64 + null (WPA2 max)
+constexpr size_t kMaxUserIdLength = 65;  // accommodate UUID or custom id
+
+enum class ProvisioningEventType : uint8_t
+{
+  Notify = 0,
+  Credentials,
+};
+
+struct NotifyPayload
+{
+  char message[kMaxNotifyLength];
+};
+
+struct CredentialsPayload
+{
+  char ssid[kMaxSsidLength];
+  char password[kMaxPasswordLength];
+  char userId[kMaxUserIdLength];
+};
+
+struct ProvisioningEvent
+{
+  ProvisioningEventType type;
+  union
+  {
+    NotifyPayload notify;
+    CredentialsPayload credentials;
+  } data;
+};
+
+QueueHandle_t g_eventQueue = nullptr;
+
 struct ParsedCredentials {
   bool valid = false;
   String ssid;
   String password;
+  String userId;
   String error;
 };
 
@@ -56,21 +98,34 @@ ParsedCredentials parseCredentials(const std::string &raw) {
   std::string payload = raw;
   payload.erase(std::remove(payload.begin(), payload.end(), '\r'), payload.end());
 
-  size_t separator = payload.find('\n');
-  if (separator == std::string::npos) {
-    separator = payload.find('|');
+  size_t firstSeparator = payload.find('\n');
+  char separatorChar = '\n';
+  if (firstSeparator == std::string::npos) {
+    firstSeparator = payload.find('|');
+    separatorChar = '|';
   }
 
-  if (separator == std::string::npos) {
+  if (firstSeparator == std::string::npos) {
     result.error = "formato";
     return result;
   }
 
-  std::string ssid(payload.begin(), payload.begin() + separator);
-  std::string password(payload.begin() + separator + 1, payload.end());
+  std::string ssid(payload.begin(), payload.begin() + firstSeparator);
+
+  size_t secondSeparator = payload.find(separatorChar, firstSeparator + 1);
+  std::string password;
+  std::string userId;
+  if (secondSeparator == std::string::npos) {
+    password.assign(payload.begin() + firstSeparator + 1, payload.end());
+  } else {
+    password.assign(payload.begin() + firstSeparator + 1,
+                    payload.begin() + secondSeparator);
+    userId.assign(payload.begin() + secondSeparator + 1, payload.end());
+  }
 
   trim(ssid);
   trim(password);
+  trim(userId);
 
   if (ssid.empty()) {
     result.error = "ssid";
@@ -80,7 +135,17 @@ ParsedCredentials parseCredentials(const std::string &raw) {
   result.valid = true;
   result.ssid = String(ssid.c_str());
   result.password = String(password.c_str());
+  result.userId = String(userId.c_str());
   return result;
+}
+
+void enqueueEvent(const ProvisioningEvent &event)
+{
+  if (!g_eventQueue)
+  {
+    return;
+  }
+  xQueueSend(g_eventQueue, &event, 0);
 }
 
 void notify(const String &message) {
@@ -99,14 +164,41 @@ class ProvisioningCallbacks : public BLECharacteristicCallbacks {
     ParsedCredentials credentials = parseCredentials(value);
 
     if (!credentials.valid) {
-      notify("error:" + credentials.error);
+      ProvisioningEvent errorEvent;
+      errorEvent.type = ProvisioningEventType::Notify;
+      snprintf(errorEvent.data.notify.message,
+               sizeof(errorEvent.data.notify.message),
+               "error:%s", credentials.error.c_str());
+      enqueueEvent(errorEvent);
       return;
     }
 
-    notify("credenciales");
+    ProvisioningEvent ackEvent;
+    ackEvent.type = ProvisioningEventType::Notify;
+    snprintf(ackEvent.data.notify.message,
+             sizeof(ackEvent.data.notify.message),
+             "credenciales");
+    enqueueEvent(ackEvent);
 
-    if (g_callback) {
-      g_callback(credentials.ssid, credentials.password);
+    ProvisioningEvent credEvent;
+    credEvent.type = ProvisioningEventType::Credentials;
+    snprintf(credEvent.data.credentials.ssid,
+             sizeof(credEvent.data.credentials.ssid),
+             "%s", credentials.ssid.c_str());
+    snprintf(credEvent.data.credentials.password,
+             sizeof(credEvent.data.credentials.password),
+             "%s", credentials.password.c_str());
+    snprintf(credEvent.data.credentials.userId,
+             sizeof(credEvent.data.credentials.userId),
+             "%s", credentials.userId.c_str());
+
+    if (xQueueSend(g_eventQueue, &credEvent, 0) != pdTRUE) {
+      ProvisioningEvent queueErrorEvent;
+      queueErrorEvent.type = ProvisioningEventType::Notify;
+      snprintf(queueErrorEvent.data.notify.message,
+               sizeof(queueErrorEvent.data.notify.message),
+               "error:cola");
+      enqueueEvent(queueErrorEvent);
     }
   }
 };
@@ -154,6 +246,11 @@ void ensureInitialized(const String &deviceId) {
 
   g_deviceId = deviceId;
   BLEDevice::init(g_deviceId.c_str());
+
+  if (!g_eventQueue)
+  {
+    g_eventQueue = xQueueCreate(kProvisioningQueueLength, sizeof(ProvisioningEvent));
+  }
 
   g_server = BLEDevice::createServer();
   g_server->setCallbacks(new ServerCallbacks());
@@ -221,6 +318,36 @@ bool isActive() { return g_sessionActive; }
 void notifyStatus(const String &message) { notify(message); }
 
 void loop() {
+  if (g_eventQueue)
+  {
+    ProvisioningEvent event;
+    while (xQueueReceive(g_eventQueue, &event, 0) == pdTRUE)
+    {
+      switch (event.type)
+      {
+      case ProvisioningEventType::Notify:
+      {
+        String message(event.data.notify.message);
+        notify(message);
+        break;
+      }
+      case ProvisioningEventType::Credentials:
+      {
+        if (g_callback)
+        {
+          String ssid(event.data.credentials.ssid);
+          String password(event.data.credentials.password);
+          String userId(event.data.credentials.userId);
+          g_callback(ssid, password, userId);
+        }
+        break;
+      }
+      default:
+        break;
+      }
+    }
+  }
+
   if (g_restartAdvertising && g_sessionActive && g_advertising) {
     g_restartAdvertising = false;
     g_advertising->start();
